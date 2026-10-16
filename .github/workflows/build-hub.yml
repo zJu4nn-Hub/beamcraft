@@ -1,0 +1,77 @@
+# Build used by the zJu4nn Hub "Mashups" tab.
+# Compiles the BeamCraft Fabric mod (beamng/minecraft, Gradle 8.14.3 + Loom 1.11.8 on JDK 21) from this fork's source
+# and packs it with the BeamNG side of the crossover (beamng/beamng-mod, Lua) laid out as a mod inside a SEPARATE
+# BeamNG user folder (bng-userfolder/current/...), the same folder upstream's launcher passes to BeamNG with -userpath.
+# Nothing from BeamNG.drive or Mojang is included. Upstream's own launcher (play.bat / winget JDK / gradlew runClient)
+# is NOT shipped: the Hub starts BeamNG and its shared Prism itself.
+# Upstream: https://github.com/Local-UAE/beamcraft (root CC0-1.0; beamng/ is MIT, JASGENIUS + justbustin).
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v0.1.0-1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: gradle/actions/wrapper-validation@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # -PnoShaderMods: leaves out Sodium/Iris (dev-client-only modRuntimeOnly deps fetched from Modrinth's maven);
+      # they never go into the jar. BngLinkTest is timing/UDP based and failed once upstream on a commit that only
+      # added melty.json (run 37968803696), so one retry before giving up.
+      - name: Fabric mod (with tests)
+        working-directory: beamng/minecraft
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --no-configuration-cache -PnoShaderMods build \
+            || { echo "::warning::build/test failed once, retrying (timing-sensitive UDP test)"; ./gradlew --no-daemon --no-configuration-cache -PnoShaderMods build; }
+
+      - name: Package
+        run: |
+          ver=$(grep '^version=' beamng/minecraft/gradle.properties | cut -d= -f2 | tr -d '\r')
+          jar="beamng/minecraft/build/libs/bng-bridge-$ver.jar"
+          test -f "$jar" || { echo "mod jar not found"; ls -la beamng/minecraft/build/libs; exit 1; }
+          test -f beamng/beamng-mod/lua/ge/extensions/mccross/bridge.lua || { echo "BeamNG extension not found"; exit 1; }
+          test -f beamng/beamng-mod/scripts/mccross/modScript.lua || { echo "BeamNG modScript not found"; exit 1; }
+
+          ud=pkg/bng-userfolder/current
+          mkdir -p pkg/mods "$ud/mods/unpacked" "$ud/settings/cloud"
+          cp "$jar" pkg/mods/
+          # BeamNG side: same layout as upstream's install-beamng-mod.ps1 / build-melty-package.ps1
+          cp -r beamng/beamng-mod "$ud/mods/unpacked/mccrossover"
+          # Same first-run settings upstream's run-beamng.ps1 writes into its own user folder (UTF-8, NO BOM:
+          # BeamNG ignores the whole file with one): window mode, full speed + sound while Minecraft has the focus,
+          # and the privacy answers to the "Enable online features?" wizard so it doesn't cover the game.
+          printf '{\n  "GraphicDisplayModes": "Window",\n  "fpsLimitBackgroundEnabled": false,\n  "AudioMuteOnWindowLoseFocus": false\n}\n' > "$ud/settings/settings.json"
+          printf '{\n  "onlineFeatures": "disable",\n  "telemetry": "disable"\n}\n' > "$ud/settings/cloud/settings.json"
+
+          cp LICENSE pkg/LICENSE-CC0.txt
+          cp beamng/LICENSE pkg/LICENSE-MIT.txt
+          cp beamng/THIRD_PARTY_NOTICES.md pkg/THIRD_PARTY_NOTICES.md
+          (cd pkg && find . -type f ! -name SHA256SUMS.txt | sort | sed 's|^\./||' | xargs -d '\n' sha256sum > SHA256SUMS.txt)
+          cat pkg/SHA256SUMS.txt
+          (cd pkg && zip -qrX "../beamcraft-hub-$ver.zip" .)
+          sha256sum "beamcraft-hub-$ver.zip"
+          stat -c '%s bytes' "beamcraft-hub-$ver.zip"
+          echo "ZIP=beamcraft-hub-$ver.zip" >> "$GITHUB_ENV"
+          echo "VER=$ver" >> "$GITHUB_ENV"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" "$ZIP" --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "BeamCraft $VER (zJu4nn Hub)" --notes "Build of Local-UAE/beamcraft $VER for the zJu4nn Hub Mashups tab, from this fork at ${{ github.sha }}: the Fabric mod (mods/) compiled from beamng/minecraft and the BeamNG extension (bng-userfolder/current/mods/unpacked/mccrossover) from beamng/beamng-mod. CC0-1.0 (root) / MIT (beamng/, JASGENIUS + justbustin). No BeamNG or Minecraft files included."
